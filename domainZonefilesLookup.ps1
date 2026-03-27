@@ -1,3 +1,8 @@
+# Requires the BIND package
+# Install with: 
+#   Windows: winget install ISC.BIND
+#   macOS: brew install bind
+
 param( [Parameter(Mandatory=$true)]
     [string]$Domain, [Parameter(Mandatory=$false)]
     [ValidateSet('A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA', 'PTR', 'ALL', 'HOSTING')]
