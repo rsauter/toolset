@@ -5,6 +5,49 @@ param( [Parameter(Mandatory=$true)]
     [string]$DnsServer
 )
 
+# Cross-platform DNS lookup helper function
+function Invoke-DnsLookup {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Type,
+        [string]$Server
+    )
+    
+    # For A and AAAA records, use .NET which works cross-platform
+    if ($Type -eq 'A' -or $Type -eq 'AAAA') {
+        try {
+            if ($Type -eq 'A') {
+                [System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object {
+                    [pscustomobject]@{ Type = 'A'; IPAddress = $_.ToString() }
+                }
+            } else {
+                [System.Net.Dns]::GetHostAddresses($Name) | Where-Object { $_.AddressFamily -eq 'InterNetworkV6' } | ForEach-Object {
+                    [pscustomobject]@{ Type = 'AAAA'; IPAddress = $_.ToString() }
+                }
+            }
+        } catch {
+            return $null
+        }
+    } else {
+        # For other record types, use dig/nslookup as fallback on macOS/Linux
+        $digPath = (Get-Command dig -ErrorAction SilentlyContinue).Source
+        if ($digPath) {
+            $args = @($Name, $Type)
+            if ($Server) { $args += "@$Server" }
+            $digOutput = & dig $args +short 2>$null
+            
+            if ($digOutput -and $digOutput.Count -gt 0) {
+                $digOutput | Where-Object { $_ -and $_ -notmatch "^;.*" } | ForEach-Object {
+                    [pscustomobject]@{ Type = $Type; Data = $_ }
+                }
+            }
+        } else {
+            Write-Host "  Hinweis: 'dig' ist nicht installiert. Bitte 'dig' installieren für erweiterte DNS-Abfragen (brew install bind)" -ForegroundColor Yellow
+            return $null
+        }
+    }
+}
+
 Write-Host "DNS Lookup für Domain: $Domain" -ForegroundColor Cyan
 Write-Host "Record Type: $RecordType" -ForegroundColor Cyan
 
@@ -22,9 +65,14 @@ try {
         # 1. IP-Adresse(n) ermitteln
         Write-Host "`n--- IP-Adresse(n) ---" -ForegroundColor Cyan
         try {
-            $ipResults = Resolve-DnsName -Name $Domain -Type A -ErrorAction Stop
-            $ipAddresses = $ipResults | Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress
-            $ipAddresses | ForEach-Object { Write-Host "  $_" -ForegroundColor White }
+            $ipAddresses = @()
+            $ipResults = Invoke-DnsLookup -Name $Domain -Type 'A' -Server $DnsServer
+            if ($ipResults) {
+                $ipAddresses = $ipResults | Select-Object -ExpandProperty IPAddress
+                $ipAddresses | ForEach-Object { Write-Host "  $_" -ForegroundColor White }
+            } else {
+                Write-Host "  Keine A-Records gefunden" -ForegroundColor Gray
+            }
         } catch {
             Write-Host "  Keine A-Records gefunden" -ForegroundColor Gray
         }
@@ -32,25 +80,22 @@ try {
         # 2. Nameserver ermitteln
         Write-Host "`n--- Nameserver ---" -ForegroundColor Cyan
         try {
-            $nsResults = Resolve-DnsName -Name $Domain -Type NS -ErrorAction Stop
-            $nameservers = $nsResults | Where-Object { $_.Type -eq 'NS' } | Select-Object -ExpandProperty NameHost
-            $nameservers | ForEach-Object { Write-Host "  $_" -ForegroundColor White }
+            $nsResults = Invoke-DnsLookup -Name $Domain -Type 'NS' -Server $DnsServer
+            if ($nsResults) {
+                $nsResults | ForEach-Object { Write-Host "  $($_.Data)" -ForegroundColor White }
+            } else {
+                Write-Host "  Keine NS-Records gefunden" -ForegroundColor Gray
+            }
         } catch {
             Write-Host "  Keine NS-Records gefunden" -ForegroundColor Gray
         }
         
-        # 3. WHOIS-ähnliche Info über IP (ISP/Hosting Provider)
+        # 3. IP-Informationen über externe API
         if ($ipAddresses) {
             Write-Host "`n--- IP-Informationen (Hosting Provider) ---" -ForegroundColor Cyan
             foreach ($ip in $ipAddresses) {
                 Write-Host "`nIP: $ip" -ForegroundColor Yellow
                 try {
-                    # Versuche Reverse DNS Lookup
-                    $ptrRecord = Resolve-DnsName -Name $ip -Type PTR -ErrorAction SilentlyContinue
-                    if ($ptrRecord) {
-                        Write-Host "  PTR: $($ptrRecord.NameHost)" -ForegroundColor White
-                    }
-                    
                     # Nutze externe API für IP-Geolocation (ipinfo.io)
                     $ipInfo = Invoke-RestMethod -Uri "https://ipinfo.io/$ip/json" -ErrorAction SilentlyContinue
                     if ($ipInfo) {
@@ -68,43 +113,44 @@ try {
         # 4. SOA Record (zeigt Primary Nameserver)
         Write-Host "`n--- SOA Record (Primary Nameserver) ---" -ForegroundColor Cyan
         try {
-            $soaResult = Resolve-DnsName -Name $Domain -Type SOA -ErrorAction Stop
-            Write-Host "  Primary NS: $($soaResult.PrimaryServer)" -ForegroundColor White
-            Write-Host "  Responsible: $($soaResult.NameAdministrator)" -ForegroundColor White
+            $soaResult = Invoke-DnsLookup -Name $Domain -Type 'SOA' -Server $DnsServer
+            if ($soaResult) {
+                Write-Host "  $($soaResult.Data)" -ForegroundColor White
+            } else {
+                Write-Host "  Keine SOA-Records gefunden" -ForegroundColor Gray
+            }
         } catch {
             Write-Host "  Keine SOA-Records gefunden" -ForegroundColor Gray
         }
         
     } elseif ($RecordType -eq 'ALL') {
         # Alle gängigen Record-Typen abfragen
-        $recordTypes = @('A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SOA')
+        $recordTypes = @('A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA')
         
         foreach ($type in $recordTypes) {
             Write-Host "`n=== $type Records ===" -ForegroundColor Yellow
             try {
-                if ($DnsServer) {
-                    $result = Resolve-DnsName -Name $Domain -Type $type -Server $DnsServer -ErrorAction Stop
+                $result = Invoke-DnsLookup -Name $Domain -Type $type -Server $DnsServer
+                if ($result) {
+                    $result | Format-Table -AutoSize
                 } else {
-                    $result = Resolve-DnsName -Name $Domain -Type $type -ErrorAction Stop
+                    Write-Host "Keine $type Records gefunden" -ForegroundColor Gray
                 }
-                $result | Format-Table -AutoSize
             } catch {
                 Write-Host "Keine $type Records gefunden" -ForegroundColor Gray
             }
         }
     } else {
         # Spezifischen Record-Typ abfragen
-        if ($DnsServer) {
-            $result = Resolve-DnsName -Name $Domain -Type $RecordType -Server $DnsServer -ErrorAction Stop
+        $result = Invoke-DnsLookup -Name $Domain -Type $RecordType -Server $DnsServer
+        
+        if ($result) {
+            $result | Format-Table -AutoSize
+            Write-Host "`n--- Details ---`n" -ForegroundColor Green
+            $result | Format-List *
         } else {
-            $result = Resolve-DnsName -Name $Domain -Type $RecordType -ErrorAction Stop
+            Write-Host "Keine $RecordType Records gefunden" -ForegroundColor Gray
         }
-        
-        $result | Format-Table -AutoSize
-        
-        # Zusätzliche Details anzeigen
-        Write-Host "`n--- Details ---`n" -ForegroundColor Green
-        $result | Format-List *
     }
     
     Write-Host "`nLookup erfolgreich abgeschlossen!" -ForegroundColor Green
