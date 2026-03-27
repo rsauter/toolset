@@ -2,6 +2,9 @@
 # Install with: 
 #   Windows: winget install ISC.BIND
 #   macOS: brew install bind
+# Command line tool 'dig' is used for advanced DNS queries, 
+# while .NET is used for basic A/AAAA lookups to ensure cross-platform compatibility.
+# Usage: dig NS buerki-reisen.ch
 
 param( [Parameter(Mandatory=$true)]
     [string]$Domain, [Parameter(Mandatory=$false)]
